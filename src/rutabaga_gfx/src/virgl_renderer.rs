@@ -253,8 +253,17 @@ const VIRGL_RENDERER_CALLBACKS: &virgl_renderer_callbacks = &virgl_renderer_call
     #[cfg(feature = "virgl_renderer_next")]
     version: 3,
     write_fence: Some(write_fence),
+    #[cfg(target_os = "macos")]
+    create_gl_context: Some(crate::cgl_context::create_gl_context),
+    #[cfg(not(target_os = "macos"))]
     create_gl_context: None,
+    #[cfg(target_os = "macos")]
+    destroy_gl_context: Some(crate::cgl_context::destroy_gl_context),
+    #[cfg(not(target_os = "macos"))]
     destroy_gl_context: None,
+    #[cfg(target_os = "macos")]
+    make_current: Some(crate::cgl_context::make_current),
+    #[cfg(not(target_os = "macos"))]
     make_current: None,
     get_drm_fd: None,
     #[cfg(not(feature = "virgl_renderer_next"))]
@@ -360,11 +369,19 @@ impl VirglRenderer {
 
     #[cfg(target_os = "macos")]
     fn map_ptr(&self, resource_id: u32) -> RutabagaResult<u64> {
-        let mut map_ptr = 0;
-        let ret = unsafe { virgl_renderer_resource_get_map_ptr(resource_id, &mut map_ptr) };
-        ret_to_res(ret)?;
-
-        Ok(map_ptr)
+        // virgl_renderer_resource_get_map_ptr only exists in krunkit's virglrenderer fork.
+        #[cfg(feature = "virgl_krunkit_map_ptr")]
+        {
+            let mut map_ptr = 0;
+            let ret = unsafe { virgl_renderer_resource_get_map_ptr(resource_id, &mut map_ptr) };
+            ret_to_res(ret)?;
+            Ok(map_ptr)
+        }
+        #[cfg(not(feature = "virgl_krunkit_map_ptr"))]
+        {
+            let _ = resource_id;
+            Err(RutabagaError::Unsupported)
+        }
     }
 
     fn query(&self, resource_id: u32) -> RutabagaResult<Resource3DInfo> {
@@ -446,6 +463,10 @@ impl RutabagaComponent for VirglRenderer {
     fn get_capset(&self, capset_id: u32, version: u32) -> Vec<u8> {
         let (_, max_size) = self.get_capset_info(capset_id);
         let mut buf = vec![0u8; max_size as usize];
+        // vrend reads the host GL version from the current context; on macOS none may be current
+        // on this thread.
+        #[cfg(target_os = "macos")]
+        crate::cgl_context::ensure_current();
         // Safe because virglrenderer is initialized by now and the given buffer is sized properly
         // for the given cap id/version.
         unsafe {

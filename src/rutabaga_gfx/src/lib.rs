@@ -20,6 +20,8 @@ mod rutabaga_os;
 mod rutabaga_snapshot;
 mod rutabaga_utils;
 mod virgl_renderer;
+#[cfg(all(target_os = "macos", feature = "virgl_renderer"))]
+mod cgl_context;
 
 pub use crate::rutabaga_core::calculate_capset_mask;
 pub use crate::rutabaga_core::calculate_capset_names;
