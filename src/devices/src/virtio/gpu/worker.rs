@@ -6,6 +6,8 @@ use std::thread;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use utils::eventfd::EventFd;
 
+const FENCE_POLL_INTERVAL_US: i64 = 100;
+
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
 use rutabaga_gfx::{
@@ -105,6 +107,15 @@ impl Worker {
         );
 
         loop {
+            // Without eventfd (macOS) virglrenderer has no sync thread, so pending fences only
+            // retire when we poll the renderer; keep polling until they have all signaled.
+            if virtio_gpu.has_pending_fences() {
+                let ready = self.wait_control_evt(FENCE_POLL_INTERVAL_US);
+                virtio_gpu.event_poll();
+                if !ready {
+                    continue;
+                }
+            }
             if let Err(e) = self.control_evt.read() {
                 error!("Failed to read control_evt: {e:?}");
                 continue;
@@ -115,6 +126,31 @@ impl Worker {
                 }
             }
         }
+    }
+
+    fn wait_control_evt(&self, timeout_us: i64) -> bool {
+        let fd = self.control_evt.as_raw_fd();
+        // SAFETY: fd_set is plain data; FD_ZERO/FD_SET initialise it for a valid fd below FD_SETSIZE.
+        let mut readfds: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::FD_ZERO(&mut readfds);
+            libc::FD_SET(fd, &mut readfds);
+        }
+        let mut timeout = libc::timeval {
+            tv_sec: (timeout_us / 1_000_000) as libc::time_t,
+            tv_usec: (timeout_us % 1_000_000) as libc::suseconds_t,
+        };
+        // SAFETY: readfds and timeout are valid for the duration of the call.
+        let ret = unsafe {
+            libc::select(
+                fd + 1,
+                &mut readfds,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut timeout,
+            )
+        };
+        ret > 0
     }
 
     fn process_gpu_command(
