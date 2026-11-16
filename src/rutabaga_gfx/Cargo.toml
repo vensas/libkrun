@@ -13,6 +13,8 @@ gfxstream_stub = []
 gpu = []
 virgl_renderer = []
 virgl_renderer_next = []
+# Use krunkit's virgl_renderer_resource_get_map_ptr (absent from upstream virglrenderer).
+virgl_krunkit_map_ptr = []
 virgl_resource_map2 = []
 minigbm = []
 # To try out Vulkano, delete the following line and uncomment the line in "dependencies". Vulkano

@@ -25,7 +25,7 @@ use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_APPLE;
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
 #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
-#[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
+#[cfg(any(target_os = "macos", all(feature = "virgl_resource_map2", target_os = "linux")))]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
 use rutabaga_gfx::{
     ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder, RutabagaChannel,
@@ -110,6 +110,14 @@ impl AssociatedScanouts {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn release_shm_mapping(resource: &mut VirtioGpuResource) {
+    if let Some((ptr, len)) = resource.shm_mapping.take() {
+        // SAFETY: (ptr, len) is exactly what mmap returned in resource_map_blob.
+        unsafe { libc::munmap(ptr as *mut c_void, len) };
+    }
+}
+
 #[derive(Copy, Clone)]
 struct VirtioGpuResource {
     id: u32,
@@ -120,6 +128,10 @@ struct VirtioGpuResource {
     size: u64, // only for blob resources
     shmem_offset: Option<u64>,
     rutabaga_external_mapping: bool,
+    /// Host mapping of a blob exported as a SHM fd (upstream virglrenderer on macOS),
+    /// kept for as long as the guest has it mapped.
+    #[cfg(target_os = "macos")]
+    shm_mapping: Option<(u64, usize)>,
 }
 
 impl VirtioGpuResource {
@@ -141,6 +153,8 @@ impl VirtioGpuResource {
             format,
             shmem_offset: None,
             rutabaga_external_mapping: false,
+            #[cfg(target_os = "macos")]
+            shm_mapping: None,
         }
     }
 }
@@ -820,7 +834,7 @@ impl VirtioGpu {
                         resource.size as usize,
                         prot,
                         libc::MAP_SHARED | libc::MAP_FIXED,
-                        export.os_handle.as_raw_fd(),
+                        std::os::fd::AsRawFd::as_raw_fd(&export.os_handle),
                         0 as libc::off_t,
                     )
                 };
@@ -890,7 +904,7 @@ impl VirtioGpu {
                         resource.size as usize,
                         prot,
                         libc::MAP_SHARED | libc::MAP_FIXED,
-                        export.os_handle.as_raw_fd(),
+                        std::os::fd::AsRawFd::as_raw_fd(&export.os_handle),
                         0 as libc::off_t,
                     )
                 };
@@ -931,10 +945,44 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-        let map_ptr = self.rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?;
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id) {
-            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE {
+            // krunkit's virglrenderer hands out a host pointer (APPLE); upstream virglrenderer
+            // backs mappable memory with POSIX shared memory and exports the fd (SHM).
+            let map_ptr = match export.handle_type {
+                RUTABAGA_MEM_HANDLE_TYPE_APPLE => {
+                    self.rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?
+                }
+                RUTABAGA_MEM_HANDLE_TYPE_SHM => {
+                    let len = resource.size as usize;
+                    // SAFETY: maps a shared memory fd we own a duplicate of; the mapping is
+                    // released in resource_unmap_blob.
+                    let ptr = unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            len,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_SHARED,
+                            std::os::fd::AsRawFd::as_raw_fd(&export.os_handle),
+                            0,
+                        )
+                    };
+                    if ptr == libc::MAP_FAILED {
+                        error!(
+                            "mmap of SHM blob {resource_id} failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                        return Err(ErrUnspec);
+                    }
+                    resource.shm_mapping = Some((ptr as u64, len));
+                    ptr as u64
+                }
+                other => {
+                    error!("blob {resource_id}: unsupported handle type {other:#x} on macOS");
+                    return Err(ErrUnspec);
+                }
+            };
+            {
                 let guest_addr = checked_blob_map_addr(
                     shm_region.guest_addr,
                     offset,
@@ -957,10 +1005,9 @@ impl VirtioGpu {
                     ))
                     .unwrap();
                 if !reply_receiver.recv().unwrap() {
+                    release_shm_mapping(resource);
                     return Err(ErrUnspec);
                 }
-            } else {
-                return Err(ErrUnspec);
             }
         } else {
             return Err(ErrUnspec);
@@ -1049,6 +1096,7 @@ impl VirtioGpu {
         }
 
         resource.shmem_offset = None;
+        release_shm_mapping(resource);
 
         Ok(OkNoData)
     }
