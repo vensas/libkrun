@@ -25,7 +25,10 @@ use libc::c_void;
 use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_DMABUF;
 #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD;
-#[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
+#[cfg(any(
+    all(target_os = "linux", feature = "virgl_resource_map2"),
+    target_os = "macos"
+))]
 use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_SHM;
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::{
@@ -37,6 +40,8 @@ use rutabaga_gfx::{
     Rutabaga, RutabagaBuilder, RutabagaDescriptor, RutabagaFence, RutabagaFenceHandler,
     RutabagaIovec, RutabagaPath, RutabagaResult, Transfer3D, VirtioFsLookup,
 };
+#[cfg(target_os = "macos")]
+use rutabaga_gfx::RutabagaAsRawDescriptor;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
@@ -154,6 +159,18 @@ struct VirtioGpuResource {
     size: u64, // only for blob resources
     shmem_offset: Option<u64>,
     rutabaga_external_mapping: bool,
+    /// Host mapping of a blob exported as a SHM fd (upstream virglrenderer on macOS),
+    /// kept for as long as the guest has it mapped.
+    #[cfg(target_os = "macos")]
+    shm_mapping: Option<(u64, usize)>,
+}
+
+#[cfg(target_os = "macos")]
+fn release_shm_mapping(resource: &mut VirtioGpuResource) {
+    if let Some((ptr, len)) = resource.shm_mapping.take() {
+        // SAFETY: (ptr, len) is exactly what mmap returned in resource_map_blob.
+        unsafe { libc::munmap(ptr as *mut c_void, len) };
+    }
 }
 
 impl VirtioGpuResource {
@@ -175,6 +192,8 @@ impl VirtioGpuResource {
             format,
             shmem_offset: None,
             rutabaga_external_mapping: false,
+            #[cfg(target_os = "macos")]
+            shm_mapping: None,
         }
     }
 }
@@ -965,12 +984,46 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-        let map_ptr = self.rutabaga.map(resource_id).map_err(|_| ErrUnspec)?.ptr;
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id)
             && let Some(mesa_handle) = export.as_mesa_handle()
         {
-            if mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
+            // krunkit's virglrenderer hands out a host pointer; upstream virglrenderer backs
+            // mappable memory with POSIX shared memory and exports the fd instead.
+            let map_ptr = match mesa_handle.handle_type {
+                RUTABAGA_HANDLE_TYPE_MEM_DMABUF => {
+                    self.rutabaga.map(resource_id).map_err(|_| ErrUnspec)?.ptr
+                }
+                RUTABAGA_HANDLE_TYPE_MEM_SHM => {
+                    let len = resource.size as usize;
+                    // SAFETY: maps a shared memory fd we hold a duplicate of; the mapping is
+                    // released in resource_unmap_blob.
+                    let ptr = unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            len,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_SHARED,
+                            mesa_handle.os_handle.as_raw_descriptor() as libc::c_int,
+                            0,
+                        )
+                    };
+                    if ptr == libc::MAP_FAILED {
+                        error!(
+                            "mmap of SHM blob {resource_id} failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                        return Err(ErrUnspec);
+                    }
+                    resource.shm_mapping = Some((ptr as u64, len));
+                    ptr as u64
+                }
+                other => {
+                    error!("blob {resource_id}: unsupported handle type {other:#x} on macOS");
+                    return Err(ErrUnspec);
+                }
+            };
+            {
                 let guest_addr = checked_blob_map_addr(
                     shm_region.guest_addr,
                     offset,
@@ -993,10 +1046,9 @@ impl VirtioGpu {
                     ))
                     .unwrap();
                 if !reply_receiver.recv().unwrap() {
+                    release_shm_mapping(resource);
                     return Err(ErrUnspec);
                 }
-            } else {
-                return Err(ErrUnspec);
             }
         } else {
             return Err(ErrUnspec);
@@ -1085,6 +1137,7 @@ impl VirtioGpu {
         }
 
         resource.shmem_offset = None;
+        release_shm_mapping(resource);
 
         Ok(OkNoData)
     }
